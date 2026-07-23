@@ -1,6 +1,11 @@
 .env.oi
 .env
 accumulation.db
+*.db-wal
+*.db-shm
+data/market.duckdb*
+data/accumulation.db*
 *.pyc
 __pycache__/
 *.log
+/tmp/

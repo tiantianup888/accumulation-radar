@@ -1,0 +1,27 @@
+services:
+  radar:
+    build:
+      context: .
+      dockerfile: radar/Dockerfile
+    environment:
+      DB_PATH: /data/accumulation.db
+      FP_LIB_PATH: /data/fingerprints.json
+    env_file:
+      - .env.oi
+    volumes:
+      - ./data:/data
+      - ./.env.oi:/app/.env.oi:ro
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      DB_PATH: /data/accumulation.db
+      FP_LIB_PATH: /data/fingerprints.json
+    volumes:
+      - ./data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
