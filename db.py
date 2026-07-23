@@ -104,6 +104,10 @@ def init_db(conn: sqlite3.Connection) -> None:
         ("fp_similarity", "REAL"),      # 与指纹的相似度
         ("fp_source", "TEXT"),          # 命中的来源指纹ID
         ("fp_signatures", "TEXT"),      # 命中时点行为签名(JSON)
+        # ML扫描策略字段(LightGBM拉盘预测)
+        ("ml_prob", "REAL"),           # 模型预测拉盘概率
+        ("ml_pos", "REAL"),            # 14日区间位置(低位护栏)
+        ("ml_features", "TEXT"),       # 关键特征快照(JSON)
     ]:
         try:
             conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {decl}")
@@ -121,8 +125,9 @@ def insert_signal(conn: sqlite3.Connection, s: dict) -> int:
          oi_usd, oi_delta_6h, oi_slope_5d, mcap, sideways_days, in_pool,
          amplitude_5d, spot_vol_ratio, spot_premium, heat,
          f_sc, m_sc, s_sc, o_sc, tags, push_text,
-         fp_mode, fp_similarity, fp_source, fp_signatures)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+         fp_mode, fp_similarity, fp_source, fp_signatures,
+         ml_prob, ml_pos, ml_features)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             s["signal_time"], s["scan_mode"], s["strategy"],
             s.get("rank_in_strategy"), s.get("score"),
@@ -137,6 +142,8 @@ def insert_signal(conn: sqlite3.Connection, s: dict) -> int:
             s.get("push_text"),
             s.get("fp_mode"), s.get("fp_similarity"), s.get("fp_source"),
             json.dumps(s["fp_signatures"], ensure_ascii=False) if s.get("fp_signatures") else None,
+            s.get("ml_prob"), s.get("ml_pos"),
+            json.dumps(s["ml_features"], ensure_ascii=False) if s.get("ml_features") else None,
         ),
     )
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]

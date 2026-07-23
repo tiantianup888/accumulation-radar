@@ -621,6 +621,8 @@ def _save_one(conn, st, scan_mode, strategy, rank, score, d, tags=None):
         "tags": tags,
         "fp_mode": d.get("fp_mode"), "fp_similarity": d.get("fp_similarity"),
         "fp_source": d.get("fp_source"), "fp_signatures": d.get("fp_signatures"),
+        "ml_prob": d.get("ml_prob"), "ml_pos": d.get("ml_pos"),
+        "ml_features": d.get("ml_features"),
     }
     rdb.insert_signal(conn, sig)
     return 1
@@ -854,46 +856,155 @@ def scan_fingerprints(conn):
     collect_benchmark(conn)
 
 
+# ── ML 扫描模式 (LightGBM 拉盘预测, 唯一生产策略) ──────────────────────
+_ML_CACHE = {"model": None, "cfg": None}
+
+def _load_ml_model():
+    """惰性加载 LightGBM 模型 + 配置 (缓存)。"""
+    if _ML_CACHE["model"] is not None:
+        return _ML_CACHE["model"], _ML_CACHE["cfg"]
+    import lightgbm as lgb
+    cfg_path = Path(os.environ.get("ML_CFG_PATH", str(Path(__file__).parent / "data" / "model_config.json")))
+    model_path = Path(os.environ.get("ML_MODEL_PATH", str(Path(__file__).parent / "data" / "model.txt")))
+    cfg = json.load(open(cfg_path))
+    model = lgb.Booster(model_file=str(model_path))
+    _ML_CACHE["model"] = model
+    _ML_CACHE["cfg"] = cfg
+    print(f"  🧠 加载 LightGBM 模型: {len(cfg['features'])}特征 best_iter={cfg['best_iteration']} SelectPR-AUC={cfg['select_pr_auc']:.4f}")
+    return model, cfg
+
+def scan_ml(conn):
+    """ML扫描模式 (策略 ml) — LightGBM 预测庄家拉盘概率。
+    数据源: market.duckdb (日K + funding, 需先 refresh 保持新鲜)。
+    流程: 全市场打分 → pos<0.3低位护栏 → Top20落库 + TG推送。
+    模型B配置(14特征含funding), 样本外 Select PR-AUC=0.2430, Precision@Top20+pos=0.30。"""
+    import numpy as np, duckdb
+    from feature_mining import build_features, load_klines_db, WINDOW
+    from funding_features import load_funding, compute_fr
+    model, cfg = _load_ml_model()
+    FEATS = cfg["features"]; POS_F = cfg["pos_filter"]; BEST = cfg["best_iteration"]
+    duck_path = os.environ.get("DUCKDB_PATH", str(Path(__file__).parent / "data" / "market.duckdb"))
+    if not Path(duck_path).exists():
+        print(f"  ⚠️ market.duckdb 不存在({duck_path}), 请先运行 refresh 模式")
+        return
+    dcon = duckdb.connect(duck_path, read_only=True)
+    fr_map = load_funding(dcon)
+    syms = [r[0] for r in dcon.execute(
+        "SELECT k.symbol FROM klines_daily k "
+        "JOIN symbol_meta m ON m.symbol=k.symbol "
+        "WHERE m.status='TRADING' GROUP BY k.symbol ORDER BY k.symbol").fetchall()]
+    print(f"  🧠 ML扫描: {len(syms)}币(TRADING) × LightGBM({len(FEATS)}特征) + pos<{POS_F}护栏")
+    rows = []
+    for i, sym in enumerate(syms):
+        bars = load_klines_db(dcon, sym)
+        if len(bars) < WINDOW:
+            continue
+        idx = len(bars) - 1
+        f = build_features(bars, idx)
+        t_dec = int(bars[idx]["ts"]) + 86400000
+        fr = compute_fr(*fr_map.get(sym, (np.array([]), np.array([]))), t_dec) if sym in fr_map else None
+        f["fr_min_early"] = fr["fr_min_early"] if fr else np.nan
+        f["fr_late_val"] = fr["fr_late_val"] if fr else np.nan
+        pos = f.get("pos", np.nan)
+        if pos is None or (isinstance(pos, float) and np.isnan(pos)) or pos >= POS_F:
+            continue  # 低位护栏: 只留 pos<0.3
+        x = np.array([[f.get(k, np.nan) for k in FEATS]])
+        prob = float(model.predict(x, num_iteration=BEST)[0])
+        rows.append({"sym": sym, "coin": sym.replace("USDT", ""), "price": bars[idx]["c"],
+                     "prob": prob, "pos": float(pos), "ret_14d": float(f.get("ret_14d", np.nan)),
+                     "amp": float(f.get("amplitude_14d", np.nan)),
+                     "fr_late": float(f["fr_late_val"]) if fr and not np.isnan(f["fr_late_val"]) else None,
+                     "feats": {k: (None if (isinstance(f.get(k), float) and np.isnan(f.get(k))) else f.get(k))
+                               for k in ["atr_14_pct", "ret_var", "fr_late_val", "ret_skew", "vol_ratio_var", "fr_min_early"]}})
+        if (i + 1) % 100 == 0:
+            print(f"    {i+1}/{len(syms)}... 过护栏 {len(rows)}", flush=True)
+    dcon.close()
+    rows.sort(key=lambda x: -x["prob"])
+    final = rows[:20]
+    print(f"  ✅ 过护栏 {len(rows)} 个低位候选 → Top20 落库")
+    if final:
+        now = datetime.now(timezone(timedelta(hours=8)))
+        lines = ["🧠 庄家拉盘ML雷达 (LightGBM, Select PR-AUC 0.2430)",
+                 "⏰ " + now.strftime("%Y-%m-%d %H:%M") + " CST",
+                 f"📊 低位护栏 pos<{POS_F} · 全市场{len(syms)}币 → {len(rows)}候选 → Top20", ""]
+        for r in final[:15]:
+            lines.append(f"  {r['coin']:<10} {r['prob']*100:.1f}% pos{r['pos']:.2f} "
+                         f"ret14d{r['ret_14d']*100:+.0f}% amp{r['amp']*100:.0f}%")
+        send_telegram("\n".join(lines))
+    persist_ml_signals(conn, final)
+    collect_price_snapshots(conn)
+    collect_benchmark(conn)
+
+def persist_ml_signals(conn, rows):
+    """ML信号落库(策略 ml)。"""
+    st = rdb.now_iso()
+    n = 0
+    for i, r in enumerate(rows):
+        d = {"sym": r["sym"], "coin": r["coin"], "price": r["price"],
+             "px_chg": r["ret_14d"] * 100, "fr_pct": r["fr_late"],
+             "ml_prob": r["prob"], "ml_pos": r["pos"], "ml_features": r["feats"]}
+        tags = ["ml", f"pos{r['pos']:.2f}"]
+        n += _save_one(conn, st, "ml", "ml", i + 1, r["prob"] * 100, d, tags=tags)
+    print(f"  💾 落库 {n} 条ML信号 @ {st}")
+
+def refresh_market_data():
+    """刷新 market.duckdb: 拉取日K + funding (运行离线fetch脚本, 写入挂载卷)。"""
+    import subprocess
+    duck_path = os.environ.get("DUCKDB_PATH", str(Path(__file__).parent / "data" / "market.duckdb"))
+    print(f"  🔄 刷新 {duck_path} (日K + funding)...")
+    for script, days in (("fetch_market_data.py", "130"), ("fetch_funding.py", "90")):
+        print(f"    -- {script} --")
+        try:
+            subprocess.run([sys.executable, script, "--days", days, "--db", duck_path],
+                           timeout=3600, check=False)
+        except Exception as e:
+            print(f"    {script} error: {e}")
+    print("  ✅ 刷新完成")
+
+
 def run_loop():
-    """守护模式：容器内运行，按时间调度子进程跑 oi/pool。"""
+    """守护模式：容器内运行，按时间调度 refresh/ml/snap/bench。
+    调度: refresh+ml 每日01:30(数据刷新后打分), snap每小时(PnL追踪), bench每日。"""
     import subprocess
     print(f"🏦 雷达守护模式启动 @ {rdb.now_iso()}")
-    last_pool_day = None
-    last_oi_hour = None
-    last_fp_hour = None
+    last_ml_day = None
+    last_snap_hour = None
+    last_bench_day = None
     while True:
         now = datetime.now(rdb.CST)
-        hh = now.hour
-        if hh != last_oi_hour and now.minute >= 5:
-            print(f"\n[-- spawn oi {now} --]")
+        hh = now.hour; today = now.date()
+        # ML扫描: 每日 01:30 (先refresh再ml, 同一子进程串行)
+        if today != last_ml_day and hh == 1 and now.minute >= 30:
+            print(f"\n[-- spawn refresh+ml {now} --]")
             try:
-                subprocess.run([sys.executable, __file__, "oi"], timeout=1800)
+                subprocess.run([sys.executable, __file__, "refresh"], timeout=3600)
+                subprocess.run([sys.executable, __file__, "ml"], timeout=1800)
             except Exception as e:
-                print(f"oi spawn error: {e}")
-            last_oi_hour = hh
-        # 指纹扫描：每6小时一次
-        if (last_fp_hour is None or hh - last_fp_hour >= 6 or last_fp_hour - hh >= 6) and now.minute >= 10:
-            print(f"\n[-- spawn fp {now} --]")
+                print(f"ml spawn error: {e}")
+            last_ml_day = today
+        # 价格快照: 每小时 :05 (PnL实时追踪)
+        if hh != last_snap_hour and now.minute >= 5:
+            print(f"\n[-- spawn snap {now} --]")
             try:
-                subprocess.run([sys.executable, __file__, "fp"], timeout=1800)
+                subprocess.run([sys.executable, __file__, "snap"], timeout=600)
             except Exception as e:
-                print(f"fp spawn error: {e}")
-            last_fp_hour = hh
-        today = now.date()
-        if today != last_pool_day and hh == 10 and now.minute >= 0:
-            print(f"\n[-- spawn pool {now} --]")
+                print(f"snap spawn error: {e}")
+            last_snap_hour = hh
+        # 基准采样: 每日 02:00
+        if today != last_bench_day and hh == 2 and now.minute >= 0:
+            print(f"\n[-- spawn bench {now} --]")
             try:
-                subprocess.run([sys.executable, __file__, "pool"], timeout=3600)
+                subprocess.run([sys.executable, __file__, "bench"], timeout=600)
             except Exception as e:
-                print(f"pool spawn error: {e}")
-            last_pool_day = today
+                print(f"bench spawn error: {e}")
+            last_bench_day = today
         time.sleep(30)
 
 
 def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else "full"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "loop"
     
-    print(f"🏦 庄家收筹雷达 v1 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🏦 庄家拉盘ML雷达 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"   模式: {mode}\n")
     
     conn = init_db()
@@ -903,25 +1014,11 @@ def main():
         collect_price_snapshots(conn); conn.close(); print("\n✅ 完成"); return
     if mode == "bench":
         collect_benchmark(conn); conn.close(); print("\n✅ 完成"); return
-    
-    if mode in ("full", "pool"):
-        # === 模块A: 更新收筹标的池 ===
-        results = scan_accumulation_pool()
-        
-        if results:
-            save_watchlist(conn, results)
-            report = build_pool_report(results)
-            if report:
-                send_telegram(report)
-    
-    if mode in ("full", "oi"):
-        # 重构后唯一策略：横盘暗筹全市场扫描（回测验证跑赢基准）
-        scan_sideways_acc(conn)
-
-    if mode in ("full", "fp"):
-        # 指纹库匹配扫描（90天样本外期望+3.11%）
-        scan_fingerprints(conn)
-
+    if mode == "refresh":
+        refresh_market_data(); conn.close(); print("\n✅ 完成"); return
+    if mode in ("ml", "full"):
+        # 唯一生产策略: LightGBM 拉盘预测 + pos<0.3低位护栏
+        scan_ml(conn)
     conn.close()
     print("\n✅ 完成")
 

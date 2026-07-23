@@ -32,12 +32,13 @@ def conn_dep():
 
 def row_to_dict(r):
     d = dict(r)
-    if d.get("tags"):
-        import json
-        try:
-            d["tags"] = json.loads(d["tags"])
-        except Exception:
-            pass
+    import json
+    for k in ("tags", "fp_signatures", "ml_features"):
+        if d.get(k):
+            try:
+                d[k] = json.loads(d[k])
+            except Exception:
+                pass
     return d
 
 

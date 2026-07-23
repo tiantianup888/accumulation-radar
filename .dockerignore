@@ -1,0 +1,11 @@
+data/*.duckdb
+data/*.duckdb.wal
+data/*.duckdb.tmp
+data/accumulation.db
+data/accumulation.db-wal
+data/accumulation.db-shm
+*.pyc
+__pycache__/
+.git
+.env
+.env.oi
